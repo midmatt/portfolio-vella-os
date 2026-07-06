@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt } from "@/lib/chat-system-prompt";
+import { ratelimit } from "@/lib/ratelimit";
 
 /**
  * Recruiter-assistant chat endpoint.
@@ -13,28 +14,6 @@ import { buildSystemPrompt } from "@/lib/chat-system-prompt";
 // Abuse/cost guards for a public endpoint.
 const MAX_MESSAGE_CHARS = 1000;
 const MAX_HISTORY_MESSAGES = 12;
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 10;
-
-// Simple in-memory IP throttle. Per-instance on serverless, so it's a soft
-// limit — fine at this scale; swap for KV/Upstash if abuse becomes real.
-const hits = new Map<string, number[]>();
-
-function rateLimited(ip: string): boolean {
-  const now = Date.now();
-  const recent = (hits.get(ip) ?? []).filter(
-    (t) => now - t < RATE_LIMIT_WINDOW_MS
-  );
-  if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
-    hits.set(ip, recent);
-    return true;
-  }
-  recent.push(now);
-  hits.set(ip, recent);
-  // Keep the map from growing unbounded.
-  if (hits.size > 5000) hits.clear();
-  return false;
-}
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -73,6 +52,24 @@ function parseMessages(body: unknown): ChatMessage[] | null {
   return trimmed;
 }
 
+function hasOversizedMessage(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const raw = (body as { messages?: unknown }).messages;
+  if (!Array.isArray(raw)) return false;
+
+  for (const m of raw) {
+    if (
+      m &&
+      typeof m === "object" &&
+      typeof (m as ChatMessage).content === "string" &&
+      (m as ChatMessage).content.length > MAX_MESSAGE_CHARS
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function POST(req: Request) {
   if (!process.env.ANTHROPIC_API_KEY) {
     return Response.json(
@@ -83,19 +80,29 @@ export async function POST(req: Request) {
 
   const ip =
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
-  if (rateLimited(ip)) {
+  const { success: withinRateLimit } = await ratelimit.limit(ip);
+  if (!withinRateLimit) {
     return Response.json(
       { error: "Too many messages — please wait a minute and try again." },
       { status: 429 }
     );
   }
 
-  let messages: ChatMessage[] | null;
+  let body: unknown;
   try {
-    messages = parseMessages(await req.json());
+    body = await req.json();
   } catch {
-    messages = null;
+    return Response.json({ error: "Invalid request." }, { status: 400 });
   }
+
+  if (hasOversizedMessage(body)) {
+    return Response.json(
+      { error: "Message is too long — please keep it under 1000 characters." },
+      { status: 413 }
+    );
+  }
+
+  const messages = parseMessages(body);
   if (!messages) {
     return Response.json({ error: "Invalid request." }, { status: 400 });
   }
